@@ -5,6 +5,9 @@ HTTP 操作签发**短期 HMAC 签名令牌**，并在使用时进行严格验�
 依赖（不需要 Redis、JWT 服务、对象存储账号等），单个 SQLite 文件即完整运行。
 
 - 🔐 **HMAC-SHA256 签名**，令牌自包含、可离线验证（多用途令牌无状态）
+- 🔑 **无中断密钥轮换**：`CAPABILITY_KEYRING` 是有序的 `kid:secret` 列表，首项签发、
+  按 `kid` 精确选键验签；保留旧 kid 即可继续验证未过期旧令牌，移除即立即拒绝，
+  并兼容无 `kid` 的旧令牌（仅用 `CAPABILITY_LEGACY_SECRET`，绝不遍历试签）
 - 🔗 **绑定 HTTP 方法与规范化路径**：令牌不能被挪用到其它动词或路径
 - ⏱️ **短期有效**：签发时指定 TTL，服务端强制上限，过期即失效
 - 🔁 **可选一次性 nonce**：成功使用后原子写入 SQLite，重放请求被拒绝
@@ -31,7 +34,7 @@ HTTP 操作签发**短期 HMAC 签名令牌**，并在使用时进行严格验�
 ├── files/               # 受保护的示例下载目录（compose 只读挂载）
 │   └── hello.txt
 ├── tests/
-│   └── test_api.py      # 34 个端到端测试（无需网络/容器）
+│   └── test_api.py      # 47 个端到端/配置测试（无需网络/容器）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -44,7 +47,7 @@ HTTP 操作签发**短期 HMAC 签名令牌**，并在使用时进行严格验�
 ### 方式一：Docker Compose（推荐）
 
 ```bash
-cp .env.example .env          # 按需修改 CAPABILITY_SECRET
+cp .env.example .env          # 按需修改 CAPABILITY_KEYRING（默认开发密钥可直接启动）
 docker compose up --build
 ```
 
@@ -55,13 +58,14 @@ docker compose up --build
 
 ```bash
 pip install -r requirements.txt
-export CAPABILITY_SECRET="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+export CAPABILITY_KEYRING="2026-09:$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 # 或：python -m app.main
 ```
 
-> 未设置 `CAPABILITY_SECRET` 时，服务会在启动时生成**进程内随机密钥**，重启后所有旧令牌
-> 失效（日志会有 WARNING）。开发可用，生产请务必固定密钥。
+> 未配置任何密钥（`CAPABILITY_KEYRING` 与 `CAPABILITY_SECRET` 均为空）时，服务会在启动时
+> 生成**进程内随机密钥**（kid=`ephemeral`），重启后所有旧令牌失效（日志会有 WARNING）。
+> 开发可用，生产请务必固定密钥环。
 
 ### 健康检查
 
@@ -92,6 +96,7 @@ curl -X POST http://localhost:8000/tokens/issue \
 {
   "token": "eyJleHAi...LjU...（base64url(payload).base64url(hmac)）",
   "token_id": "z1w6w4XPKcDQ2mkotgWgng",
+  "kid": "2026-09",
   "method": "GET",
   "path": "/files/hello.txt",
   "issued_at": 1727000000,
@@ -167,6 +172,7 @@ curl -X POST http://localhost:8000/tokens/verify \
   "one_time": true,
   "consumed": true,
   "token_id": "z1w6w4XPKcDQ2mkotgWgng",
+  "kid": "2026-09",
   "subject": "alice",
   "extra": {}
 }
@@ -223,13 +229,19 @@ Docker Compose 场景下把 `CAPABILITY_ADMIN_KEY` 写进 `.env`（见 `.env.exa
 `verify_token` 按以下顺序检查，任何一步失败立即返回稳定错误码：
 
 1. **结构**：令牌必须为 `<base64url(payload)>.<base64url(signature)>`，payload 是 JSON 对象；
-2. **签名**：`HMAC-SHA256(secret, payload)` 与令牌附带签名用
+2. **选键（按 `kid` 精确选择，绝不遍历试签）**：
+   - 负载含 `kid`：只在密钥环中查找该 id；找不到直接返回
+     `401 unknown_key`，**不会**再尝试其它任何密钥；
+   - 负载不含 `kid`（轮换前的旧格式令牌）：**只**用
+     `CAPABILITY_LEGACY_SECRET` 校验；未配置旧密钥时返回 `401 unknown_key`；
+3. **签名**：用选定的那一把密钥计算 `HMAC-SHA256(secret, payload)`，与令牌附带签名用
    `hmac.compare_digest` 常量时间比较，防止时序攻击；
-3. **负载声明**：版本号 `v=1`，`m`/`p`/`jti` 为非空字符串，`iat`/`exp` 为整数且 `iat <= exp`，`one` 为布尔；
-4. **过期时间**：当前时间 `>= exp` 即拒绝（`expired`）；
-5. **方法绑定**：令牌方法 ≠ 请求方法返回 `403 method_mismatch`；
-6. **路径绑定**：令牌路径 ≠ 规范化后的请求路径返回 `403 path_mismatch`；
-7. **主体撤销 + 一次性 nonce**：在**同一个 `BEGIN IMMEDIATE` 事务**中先查
+4. **负载声明**：版本号 `v=1`，`kid`（存在时）/`m`/`p`/`jti` 为非空字符串，
+   `iat`/`exp` 为整数且 `iat <= exp`，`one` 为布尔；
+5. **过期时间**：当前时间 `>= exp` 即拒绝（`expired`）；
+6. **方法绑定**：令牌方法 ≠ 请求方法返回 `403 method_mismatch`；
+7. **路径绑定**：令牌路径 ≠ 规范化后的请求路径返回 `403 path_mismatch`；
+8. **主体撤销 + 一次性 nonce**：在**同一个 `BEGIN IMMEDIATE` 事务**中先查
    `subject_revocations`（`iat <= cutoff` 则返回 `401 subject_revoked`，且不消耗
    nonce），再在需要时原子写入 `consumed_nonces`（已存在则返回 `nonce_replayed`）。
    撤销与验证并发竞争时由事务串行化裁决：要么验证先提交（nonce 已消费、撤销后至），
@@ -254,6 +266,7 @@ Docker Compose 场景下把 `CAPABILITY_ADMIN_KEY` 写进 `.env`（见 `.env.exa
 | `bad_signature` | 401 | HMAC 签名不匹配（令牌被篡改或密钥不同） |
 | `bad_payload` | 401 | 负载声明类型/版本非法 |
 | `expired` | 401 | 令牌已过期 |
+| `unknown_key` | 401 | 令牌 `kid` 不在密钥环中（未知/已退役），或无 `kid` 的旧令牌没有配置 `CAPABILITY_LEGACY_SECRET` |
 | `nonce_replayed` | 401 | 一次性令牌被重复使用 |
 | `subject_revoked` | 401 | 主体已被撤销（`iat` 不晚于撤销截止时间） |
 | `method_mismatch` | 403 | HTTP 方法与绑定不一致 |
@@ -268,24 +281,74 @@ Docker Compose 场景下把 `CAPABILITY_ADMIN_KEY` 写进 `.env`（见 `.env.exa
 <base64url(payload_json)>.<base64url(hmac_sha256(secret, payload_json))>
 ```
 
-负载（键按字典序排序的紧凑 JSON，全部纳入签名）：
+负载（紧凑 JSON，签发时键按字典序规范化，全部纳入签名）：
 
 ```json
 {
   "v": 1,
+  "kid": "2026-09",
   "m": "GET",
   "p": "/files/hello.txt",
   "iat": 1727000000,
   "exp": 1727000120,
-  "jti": "z1w6w4XPKcDQ2mkotgWgng",
+  "jti": "z1w6w4XPKcDAQ2mkotgWgng",
   "one": true,
   "sub": "alice",
   "ext": {}
 }
 ```
 
+- `kid` 是签名密钥在密钥环中的标识（**同样受签名保护**），验签时按它精确选键；
+  轮换前签发的旧令牌没有这一项，只能用 `CAPABILITY_LEGACY_SECRET` 校验；
 - 多用途令牌（`one=false`）**完全无状态**：只靠签名和过期即可验证，数据库不记录任何东西；
 - 一次性令牌只在服务端记住一个不透明 nonce（`jti`），不存储令牌或负载内容。
+
+## 无中断 HMAC 密钥轮换
+
+轮换不需要停机，也不会让未过期的旧令牌失效。密钥通过 `CAPABILITY_KEYRING` 配置——
+一个**有序**的逗号分隔列表，每项为 `kid:secret`：
+
+- **首项 = 当前签发密钥**：新令牌的签名负载写入它的 `kid`，签发响应里也会回显；
+- **其余项 = 仅用于验签的旧密钥**：令牌携带哪个 `kid`，就用哪一把密钥验签，
+  **绝不遍历密钥环逐把试签**；
+- **移除某 kid 后立即拒绝**：该 kid 签发的令牌（哪怕未过期）一律
+  `401 unknown_key`；
+- 启动时严格校验：**重复 kid、空密钥、缺少 `:` 分隔符、非法 kid** 都会直接报错退出；
+  `CAPABILITY_KEYRING` 与 `CAPABILITY_SECRET` 同时设置也属于冲突配置，拒绝启动。
+
+推荐三步轮换（TTL 最长 1 小时的场景，等待一个 `CAPABILITY_MAX_TTL` 即可清理旧键）：
+
+```bash
+# 1) 生成新密钥，放到列表首位；旧密钥下移，继续负责旧令牌验签
+NEW_SECRET="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+#    .env 中改为：
+#    CAPABILITY_KEYRING=2026-12:<NEW_SECRET>,2026-09:<PREVIOUS_SECRET>
+docker compose up -d
+
+# 2) 部署后新签发的令牌 kid=2026-12；未过期的旧令牌照常验证
+curl -s -X POST http://localhost:8000/tokens/issue \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"GET","path":"/files/hello.txt"}' | grep kid
+#   "kid": "2026-12"
+
+# 3) 等所有 kid=2026-09 的令牌过期（>= CAPABILITY_MAX_TTL）后，删掉该项即完成轮换
+#    CAPABILITY_KEYRING=2026-12:<NEW_SECRET>
+```
+
+### 兼容轮换前的旧令牌
+
+升级本功能前签发的令牌负载里没有 `kid`。这类令牌**只会**用
+`CAPABILITY_LEGACY_SECRET` 校验，密钥环中的任何密钥都不会拿来对它们试签：
+
+- 升级时把旧的 `CAPABILITY_SECRET` 值原样设为 `CAPABILITY_LEGACY_SECRET`，
+  旧令牌在过期前继续可用；确认全部过期后清空该变量，之后无 `kid` 令牌一律
+  `401 unknown_key`；
+- 反过来，带 `kid` 的令牌即使其密钥值恰好等于旧密钥，也必须按 `kid` 在环中选键，
+  不会落到旧密钥通道。
+
+> **向后兼容**：只设置老变量 `CAPABILITY_SECRET` 仍可一键启动——它同时充当签发密钥
+> （kid=`default`）与旧令牌验签密钥，行为与升级前完全一致；但它不能与
+> `CAPABILITY_KEYRING` 同时出现（启动会报冲突）。
 
 ## 一次性 nonce 的原子性（防重放）
 
@@ -325,7 +388,9 @@ CREATE TABLE subject_revocations (
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CAPABILITY_SECRET` | （启动时随机生成） | HMAC 签名密钥；生产必须固定并保密 |
+| `CAPABILITY_KEYRING` | （未设置） | 有序逗号分隔 `kid:secret` 列表；**首项签发新令牌**，全部项按 `kid` 精确验签。kid 限 1–128 个 `[A-Za-z0-9._-]` 字符，密钥非空（可含 `:`），kid 不可重复 |
+| `CAPABILITY_LEGACY_SECRET` | 空（拒绝无 kid 旧令牌） | 无 `kid` 旧令牌的**唯一**验签密钥；不用于带 kid 的令牌，也不触发密钥遍历 |
+| `CAPABILITY_SECRET` | （启动时随机生成） | **已废弃的单密钥模式**：未配置 keyring 时同时作为签发密钥（kid=`default`）和旧令牌密钥；与 `CAPABILITY_KEYRING` 同时设置会启动失败 |
 | `CAPABILITY_ISSUER_KEY` | 空（签发不鉴权） | 设置后，调用 `/tokens/issue` 须带匹配的 `X-Issuer-Key` 头 |
 | `CAPABILITY_ADMIN_KEY` | 空（管理接口停用） | 设置后，调用 `/tokens/revoke-subject`、`/tokens/revocations` 须带匹配的 `X-Admin-Key` 头；未设置时这两个接口返回 503 |
 | `CAPABILITY_DB_PATH` | `./data/capabilities.db` | SQLite 文件路径，启动自动建库建表 |
@@ -347,11 +412,16 @@ python tests/test_api.py
 
 覆盖：签发与 TTL 截断、路径规范化、签发密钥门禁、签名篡改、负载篡改、方法/路径绑定、
 过期、畸形令牌、一次性消费、dry-run、**12 线程并发重放只有 1 个成功**、无令牌下载、
-三种携带方式、HEAD/GET 绑定、缺失文件、目录穿越、健康检查，以及主体撤销相关的
+三种携带方式、HEAD/GET 绑定、缺失文件、目录穿越、健康检查，主体撤销相关的
 管理端点鉴权（503/401）、撤销后旧令牌失效新令牌不受影响、截止时间边界（`iat == cutoff`
 也被撤销）、**被撤销的一次性令牌不消耗 nonce**、恢复（含对未撤销主体的幂等恢复）、
 撤销列表、dry-run 同样受撤销约束、**12 线程并发验证全部被撤销拦截**、
-**8 令牌与撤销并发竞争的原子性**、过期撤销记录清理等 34 个用例。
+**8 令牌与撤销并发竞争的原子性**、过期撤销记录清理，以及**密钥轮换**：新令牌写入当前
+kid、保留旧 kid 继续验签、移除 kid 立即 `unknown_key`、未知 kid 拒绝、无 kid 旧令牌
+仅用 legacy 密钥（用环内密钥伪造的旧格式令牌必须 `bad_signature`，证明不做遍历试签）、
+篡改 kid 后按新选键验签失败、非字符串 kid 为 `bad_payload`，以及密钥环解析与启动期
+冲突校验（重复 kid、空密钥、非法条目、keyring 与单密钥互斥、legacy 必须成对配置、
+单密钥向后兼容、无密钥时生成临时密钥）共 47 个用例。
 
 ## 部署说明
 
@@ -363,9 +433,11 @@ python tests/test_api.py
 
 ## 安全建议
 
-1. 生产环境始终设置强随机 `CAPABILITY_SECRET`，并通过密钥管理机制注入，不要提交到仓库；
+1. 生产环境始终通过 `CAPABILITY_KEYRING` 配置强随机密钥并由密钥管理机制注入，不要提交到仓库；
+   轮换按「新密钥置顶 → 等待一个 `CAPABILITY_MAX_TTL` → 删除旧 kid」进行，无需停机；
 2. TTL 尽量短（分钟级），需要防重放的场景使用 `one_time=true`；
 3. 令牌应通过 HTTPS（TLS）传输，查询参数形式可能出现在访问日志中，敏感场景优先用请求头；
-4. 轮换密钥时可在负载中引入 `kid` 并支持多密钥验签（当前版本固定单密钥）；
+4. 升级后把旧 `CAPABILITY_SECRET` 值临时放入 `CAPABILITY_LEGACY_SECRET` 以兼容存量无 `kid`
+   令牌，待其全部过期后清空；不要长期保留旧 kid/旧密钥；
 5. 撤销管理接口务必配置强随机 `CAPABILITY_ADMIN_KEY` 并只在管理面暴露；未配置时接口
    自动停用（503），不存在"忘记配置就裸奔"的窗口。

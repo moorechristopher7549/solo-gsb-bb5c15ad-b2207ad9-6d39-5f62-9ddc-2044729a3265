@@ -8,6 +8,7 @@ Token wire format (URL-safe, no padding)::
 
     {
       "v":   1,                 # token version
+      "kid": "2026-09",         # key id of the signing key in the keyring
       "m":   "GET",             # bound HTTP method (canonical, upper case)
       "p":   "/files/report",   # bound canonical path
       "iat": 1727000000,        # issued-at, unix seconds
@@ -20,6 +21,17 @@ Token wire format (URL-safe, no padding)::
 
 The signature covers the method and path as part of the payload, so a token
 cannot be moved to another endpoint or verb without breaking the MAC.
+
+Key rotation
+------------
+
+Every newly issued token carries the ``kid`` of the *first* key in the
+keyring, and verification selects **exactly one** key by that id — the
+keyring is never searched by trial signature. Tokens without a ``kid``
+(issued before keyring support existed) are verified only against the
+dedicated legacy key. An unknown or unprovisioned ``kid`` fails with
+``unknown_key``; dropping a retired id therefore invalidates its tokens
+immediately, while keeping it lets still-unexpired old tokens validate.
 """
 
 from __future__ import annotations
@@ -41,20 +53,115 @@ TOKEN_VERSION = 1
 _ALGORITHM = "sha256"
 SEP_RUN_RE = re.compile(r"/+")
 
+#: Key ids are conservative tokens so they can appear in env configs and logs.
+KID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+KEYRING_SEP_RE = re.compile(r"\s*,\s*")
+
+#: kid used when a deployment is upgraded without CAPABILITY_KEYRING and the
+#: legacy CAPABILITY_SECRET doubles as the current signing key.
+DEFAULT_KID = "default"
+
+#: kid assigned to the random key generated when nothing is configured at all.
+EPHEMERAL_KID = "ephemeral"
+
+
+class KeyConfigError(ValueError):
+    """Invalid CAPABILITY_KEYRING / key configuration (fail-closed at startup)."""
+
 
 class TokenError(Exception):
     """Raised when a token fails verification.
 
     ``code`` is a stable machine-readable string returned by the HTTP API:
 
-    malformed / bad_signature / bad_payload / expired / method_mismatch /
-    path_mismatch / nonce_replayed / subject_revoked
+    malformed / bad_signature / bad_payload / expired / unknown_key /
+    method_mismatch / path_mismatch / nonce_replayed / subject_revoked
     """
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+@dataclass(frozen=True)
+class Keyring:
+    """Ordered set of HMAC keys.
+
+    ``keys`` is ordered for signing/rotation: the first entry is the current
+    signing key, the rest are retired keys kept only for verification of
+    still-unexpired tokens. ``legacy_key`` is the one and only key used for
+    old tokens that carry no ``kid`` claim — such tokens never trigger a
+    search over the keyring.
+    """
+
+    keys: tuple[tuple[str, bytes], ...]
+    legacy_key: bytes | None = None
+
+    @property
+    def current_kid(self) -> str:
+        return self.keys[0][0]
+
+    @property
+    def current_key(self) -> bytes:
+        return self.keys[0][1]
+
+    @property
+    def key_ids(self) -> tuple[str, ...]:
+        return tuple(kid for kid, _ in self.keys)
+
+    def key_for(self, kid: str) -> bytes | None:
+        """Exact kid lookup; no trial signing against other keys."""
+        for candidate, secret in self.keys:
+            if candidate == kid:
+                return secret
+        return None
+
+
+def parse_keyring(raw: str) -> tuple[tuple[str, bytes], ...]:
+    """Parse the CAPABILITY_KEYRING value into ordered ``(kid, secret)`` pairs.
+
+    Format: a comma-separated ordered list of ``kid:secret`` entries, first
+    entry being the current signing key, e.g.::
+
+        2026-09:<new-secret>,2026-01:<old-secret>
+
+    Commas separate entries and the *first* colon separates kid from secret,
+    so secrets may themselves contain colons. Duplicate kids and empty
+    secrets/kids raise :class:`KeyConfigError`.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        raise KeyConfigError(
+            "CAPABILITY_KEYRING is set but empty: provide at least one 'kid:secret' entry"
+        )
+    entries: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(KEYRING_SEP_RE.split(stripped), start=1):
+        if not entry:
+            raise KeyConfigError(
+                f"CAPABILITY_KEYRING entry #{index} is empty "
+                "(expected 'kid:secret'; check for stray commas)"
+            )
+        if ":" not in entry:
+            raise KeyConfigError(
+                f"CAPABILITY_KEYRING entry {entry[:16]!r} is missing the 'kid:secret' separator"
+            )
+        kid, _, secret = entry.partition(":")
+        if not kid or not KID_RE.fullmatch(kid):
+            raise KeyConfigError(
+                f"CAPABILITY_KEYRING entry #{index} has an invalid kid {kid!r}: "
+                "use 1-128 characters from [A-Za-z0-9._-]"
+            )
+        if not secret:
+            raise KeyConfigError(
+                f"CAPABILITY_KEYRING entry {kid!r} has an empty secret"
+            )
+        if kid in seen:
+            raise KeyConfigError(f"CAPABILITY_KEYRING contains duplicate kid {kid!r}")
+        seen.add(kid)
+        entries.append((kid, secret.encode("utf-8")))
+    return tuple(entries)
 
 
 def canonical_path(path: str) -> str:
@@ -103,6 +210,7 @@ def new_nonce() -> str:
 
 def build_payload(
     *,
+    kid: str | None,
     method: str,
     path: str,
     expires_at: int,
@@ -121,6 +229,9 @@ def build_payload(
         "jti": nonce,
         "one": bool(one_time),
     }
+    # kid=None reproduces the pre-rotation (kid-less) token format.
+    if kid is not None:
+        payload["kid"] = kid
     if subject is not None:
         payload["sub"] = str(subject)
     if extra:
@@ -139,6 +250,7 @@ def _payload_to_bytes(payload: dict[str, Any]) -> bytes:
 class IssuedToken:
     token: str
     payload: dict[str, Any]
+    kid: str | None
     method: str
     path: str
     expires_at: int
@@ -150,6 +262,7 @@ class IssuedToken:
 def issue_token(
     secret_key: bytes,
     *,
+    kid: str | None = None,
     method: str,
     path: str,
     ttl_seconds: int,
@@ -167,6 +280,7 @@ def issue_token(
     nonce = nonce or new_nonce()
     expires_at = now + int(ttl_seconds)
     payload = build_payload(
+        kid=kid,
         method=method,
         path=path,
         expires_at=expires_at,
@@ -182,6 +296,7 @@ def issue_token(
     return IssuedToken(
         token=token,
         payload=payload,
+        kid=kid,
         method=method,
         path=path,
         expires_at=expires_at,
@@ -201,6 +316,8 @@ class VerifiedToken:
     one_time: bool
     subject: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    #: id of the key that verified the token; None for kid-less legacy tokens.
+    kid: str | None = None
 
 
 def parse_token(token: str) -> tuple[dict[str, Any], bytes, bytes]:
@@ -238,10 +355,44 @@ def _require_int(payload: dict[str, Any], key: str) -> int:
     return value
 
 
+def _select_verification_key(
+    payload: dict[str, Any], keyring: Keyring
+) -> tuple[bytes, str | None]:
+    """Pick exactly one verification key — never by trying signatures.
+
+    * A token with a ``kid`` claim is verified with that exact key id; an
+      unknown id fails with ``unknown_key`` instead of falling through to
+      another key.
+    * A token without ``kid`` (pre-rotation format) is verified **only** with
+      the dedicated legacy key. When no legacy key is configured there is no
+      key to try: fail with ``unknown_key``.
+
+    Returns ``(secret_key, kid)`` where ``kid`` is ``None`` for legacy tokens.
+    """
+    if "kid" in payload:
+        kid = payload["kid"]
+        if not isinstance(kid, str) or not kid:
+            raise TokenError("bad_payload", "claim 'kid' must be a non-empty string")
+        secret_key = keyring.key_for(kid)
+        if secret_key is None:
+            raise TokenError(
+                "unknown_key",
+                f"token references unknown or retired key id {kid!r}",
+            )
+        return secret_key, kid
+
+    if keyring.legacy_key is None:
+        raise TokenError(
+            "unknown_key",
+            "token has no 'kid' claim and no legacy key is configured",
+        )
+    return keyring.legacy_key, None
+
+
 def verify_token(
     token: str,
     *,
-    secret_key: bytes,
+    keyring: Keyring,
     method: str,
     path: str,
     db: Database,
@@ -253,12 +404,15 @@ def verify_token(
     Verification order:
 
     1. structure (parse / base64 / JSON),
-    2. HMAC signature (constant-time compare),
-    3. payload claim types and version,
-    4. expiry,
-    5. method binding,
-    6. path binding,
-    7. subject revocation + one-time nonce consumption, decided inside a
+    2. key selection by the signed ``kid`` claim (exact match; legacy kid-less
+       tokens use the dedicated legacy key only — the keyring is never
+       searched by trial signature),
+    3. HMAC signature (constant-time compare),
+    4. payload claim types and version,
+    5. expiry,
+    6. method binding,
+    7. path binding,
+    8. subject revocation + one-time nonce consumption, decided inside a
        single SQLite transaction: a token whose ``iat`` is not after the
        subject's revocation cutoff is rejected with ``subject_revoked``
        and its nonce is *not* burned.
@@ -269,6 +423,8 @@ def verify_token(
     """
     now = int(time.time()) if now is None else now
     payload, payload_b, signature = parse_token(token)
+
+    secret_key, kid = _select_verification_key(payload, keyring)
 
     expected = hmac.new(secret_key, payload_b, hashlib.sha256).digest()
     if not hmac.compare_digest(expected, signature):
@@ -333,4 +489,5 @@ def verify_token(
         one_time=one_time,
         subject=subject,
         extra=extra,
+        kid=kid,
     )

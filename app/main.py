@@ -48,6 +48,7 @@ _ERROR_STATUS = {
     "bad_signature": status.HTTP_401_UNAUTHORIZED,
     "bad_payload": status.HTTP_401_UNAUTHORIZED,
     "expired": status.HTTP_401_UNAUTHORIZED,
+    "unknown_key": status.HTTP_401_UNAUTHORIZED,
     "nonce_replayed": status.HTTP_401_UNAUTHORIZED,
     "subject_revoked": status.HTTP_401_UNAUTHORIZED,
     "method_mismatch": status.HTTP_403_FORBIDDEN,
@@ -106,8 +107,17 @@ async def lifespan(app: FastAPI) -> None:
 
     if settings.ephemeral:
         logger.warning(
-            "CAPABILITY_SECRET is not set: generated an ephemeral key. "
-            "Tokens will not survive a restart. Set CAPABILITY_SECRET in production."
+            "No signing key configured: generated an ephemeral key "
+            "(kid=%s). Tokens will not survive a restart. Set CAPABILITY_KEYRING "
+            "in production.",
+            settings.current_kid,
+        )
+    else:
+        logger.info(
+            "Keyring loaded: signing kid=%s, verification kids=%s, legacy tokens %s",
+            settings.current_kid,
+            ",".join(settings.keyring.key_ids),
+            "accepted" if settings.keyring.legacy_key is not None else "rejected",
         )
 
     app.state.settings = settings
@@ -134,11 +144,13 @@ async def lifespan(app: FastAPI) -> None:
 
 app = FastAPI(
     title="Capability Token API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Issue short-lived HMAC-signed capability tokens for HTTP operations "
         "(e.g. file downloads) and verify method/path binding, expiry, "
-        "signature, one-time nonces and subject-level revocation."
+        "kid-selected key signature, one-time nonces and subject-level "
+        "revocation. Supports non-disruptive HMAC key rotation via an ordered "
+        "CAPABILITY_KEYRING."
     ),
     lifespan=lifespan,
 )
@@ -222,6 +234,7 @@ def issue(body: IssueTokenRequest, settings: SettingsDep) -> IssuedTokenResponse
 
     issued = issue_token(
         settings.secret_key,
+        kid=settings.current_kid,
         method=body.method,
         path=body.path,
         ttl_seconds=ttl,
@@ -230,8 +243,9 @@ def issue(body: IssueTokenRequest, settings: SettingsDep) -> IssuedTokenResponse
         extra=body.extra,
     )
     logger.info(
-        "Issued token jti=%s %s %s exp=%s one_time=%s sub=%s",
+        "Issued token jti=%s kid=%s %s %s exp=%s one_time=%s sub=%s",
         issued.nonce,
+        issued.kid,
         issued.method,
         issued.path,
         issued.expires_at,
@@ -241,6 +255,7 @@ def issue(body: IssueTokenRequest, settings: SettingsDep) -> IssuedTokenResponse
     return IssuedTokenResponse(
         token=issued.token,
         token_id=issued.nonce,
+        kid=issued.kid,
         method=issued.method,
         path=issued.path,
         issued_at=issued.payload["iat"],
@@ -256,7 +271,7 @@ def verify(body: VerifyTokenRequest, settings: SettingsDep, db: DbDep) -> Verify
     try:
         verified = verify_token(
             body.token,
-            secret_key=settings.secret_key,
+            keyring=settings.keyring,
             method=canonical_method(body.method),
             path=canonical_path(body.path),
             db=db,
@@ -275,6 +290,7 @@ def verify(body: VerifyTokenRequest, settings: SettingsDep, db: DbDep) -> Verify
         one_time=verified.one_time,
         consumed=verified.one_time and body.consume,
         token_id=verified.nonce,
+        kid=verified.kid,
         subject=verified.subject,
         extra=verified.extra,
     )
@@ -370,7 +386,7 @@ def download_file(
     try:
         verified = verify_token(
             raw_token,
-            secret_key=settings.secret_key,
+            keyring=settings.keyring,
             method=request.method,
             path=request_path,
             db=db,

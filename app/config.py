@@ -1,8 +1,21 @@
 """Application configuration loaded from environment variables.
 
-No third-party accounts are required: the only secret is the HMAC key used
-to sign tokens. If it is not provided an ephemeral random key is generated at
-startup (tokens then become invalid across restarts).
+No third-party accounts are required. The HMAC keys used to sign tokens come
+from an ordered *keyring* that supports non-disruptive rotation:
+
+* ``CAPABILITY_KEYRING`` — comma-separated ordered ``kid:secret`` list; the
+  first entry signs new tokens and every entry verifies tokens by exact
+  ``kid``. Keep retired kids to keep validating still-unexpired old tokens;
+  remove one to reject its tokens immediately.
+* ``CAPABILITY_LEGACY_SECRET`` — the one and only key accepted for tokens
+  issued before keyring support (payload without ``kid``). It never matches
+  kid'd tokens and the keyring is never searched by trial signature.
+
+For backwards compatibility ``CAPABILITY_SECRET`` keeps working: when no
+keyring is configured it becomes both the current signing key (kid
+``default``) and the legacy verification key. If no key is provided at all
+an ephemeral random key is generated at startup (tokens then become invalid
+across restarts).
 """
 
 from __future__ import annotations
@@ -10,6 +23,14 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass
+
+from .tokens import (
+    DEFAULT_KID,
+    EPHEMERAL_KID,
+    KeyConfigError,
+    Keyring,
+    parse_keyring,
+)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -25,8 +46,8 @@ def _int_env(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Settings:
-    #: HMAC signing key (env: CAPABILITY_SECRET).
-    secret_key: bytes
+    #: Ordered keyring: first entry signs, every entry verifies by exact kid.
+    keyring: Keyring
     #: SQLite database file path (env: CAPABILITY_DB_PATH).
     db_path: str
     #: Directory that backs the guarded GET /files/{name} resource.
@@ -40,16 +61,70 @@ class Settings:
     #: Optional shared key guarding the revocation admin endpoints
     #: (header X-Admin-Key). When unset those endpoints are disabled (503).
     admin_key: str | None
-    #: True when no CAPABILITY_SECRET was configured and a random key is used.
+    #: True when no signing key was configured and a random key is used.
     ephemeral: bool
+
+    @property
+    def secret_key(self) -> bytes:
+        """Current signing key (first keyring entry)."""
+        return self.keyring.current_key
+
+    @property
+    def current_kid(self) -> str:
+        """kid stamped onto newly issued tokens."""
+        return self.keyring.current_kid
+
+
+def _build_keyring() -> tuple[Keyring, bool]:
+    """Construct the keyring from the environment.
+
+    Returns ``(keyring, ephemeral)``. Conflicting or malformed configuration
+    raises RuntimeError so the process refuses to start (fail closed).
+    """
+    keyring_raw = os.environ.get("CAPABILITY_KEYRING")
+    keyring_set = keyring_raw is not None and keyring_raw != ""
+    legacy_raw = os.environ.get("CAPABILITY_LEGACY_SECRET", "").strip()
+    single_raw = os.environ.get("CAPABILITY_SECRET", "").strip()
+
+    legacy_key = legacy_raw.encode("utf-8") if legacy_raw else None
+
+    if keyring_set:
+        if single_raw:
+            raise RuntimeError(
+                "CAPABILITY_KEYRING and the deprecated CAPABILITY_SECRET are "
+                "both set. Put the current key first in CAPABILITY_KEYRING "
+                "(kid 'default' to keep old tokens verifiable) and remove "
+                "CAPABILITY_SECRET."
+            )
+        try:
+            keys = parse_keyring(keyring_raw)
+        except KeyConfigError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return Keyring(keys=keys, legacy_key=legacy_key), False
+
+    # Backwards-compatible single-key mode.
+    if single_raw:
+        if legacy_raw:
+            raise RuntimeError(
+                "CAPABILITY_LEGACY_SECRET only applies with CAPABILITY_KEYRING; "
+                "in single-key (CAPABILITY_SECRET) mode that secret is already "
+                "used for kid-less legacy tokens."
+            )
+        key = single_raw.encode("utf-8")
+        return Keyring(keys=((DEFAULT_KID, key),), legacy_key=key), False
+
+    # Nothing configured: an ephemeral random key for this process only.
+    if legacy_raw:
+        raise RuntimeError(
+            "CAPABILITY_LEGACY_SECRET is set but there is no keyring to pair "
+            "it with: set CAPABILITY_KEYRING (kid:secret list) as well."
+        )
+    random_key = secrets.token_urlsafe(32).encode("utf-8")
+    return Keyring(keys=((EPHEMERAL_KID, random_key),), legacy_key=None), True
 
 
 def load_settings() -> Settings:
-    secret = os.environ.get("CAPABILITY_SECRET", "").strip()
-    ephemeral = not secret
-    if ephemeral:
-        # 32-byte URL-safe random key for this process only.
-        secret = secrets.token_urlsafe(32)
+    keyring, ephemeral = _build_keyring()
 
     issuer_key = os.environ.get("CAPABILITY_ISSUER_KEY", "").strip() or None
     admin_key = os.environ.get("CAPABILITY_ADMIN_KEY", "").strip() or None
@@ -64,7 +139,7 @@ def load_settings() -> Settings:
         )
 
     return Settings(
-        secret_key=secret.encode("utf-8"),
+        keyring=keyring,
         db_path=os.environ.get(
             "CAPABILITY_DB_PATH", os.path.join(os.getcwd(), "data", "capabilities.db")
         ),

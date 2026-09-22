@@ -43,6 +43,7 @@ class IssueTokenRequest(BaseModel):
 class IssuedTokenResponse(BaseModel):
     token: str
     token_id: str
+    kid: str = Field(description="Key id of the keyring entry that signed this token")
     method: str
     path: str
     issued_at: int
@@ -82,6 +83,10 @@ class VerifyTokenResponse(BaseModel):
     one_time: bool
     consumed: bool
     token_id: str
+    kid: str | None = Field(
+        default=None,
+        description="Key id that verified the token; null for kid-less legacy tokens",
+    )
     subject: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 

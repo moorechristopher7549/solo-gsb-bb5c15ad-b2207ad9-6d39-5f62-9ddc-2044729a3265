@@ -6,9 +6,20 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Override these in .env or your shell. A default dev secret is shipped
-      # in .env.example so the stack runs out of the box; change it for real use.
-      CAPABILITY_SECRET: ${CAPABILITY_SECRET:-dev-insecure-secret-change-me-0123456789}
+      # Override these in .env or your shell. A default dev keyring is
+      # shipped in .env.example so the stack runs out of the box; rotate it
+      # for real use.
+      #
+      # CAPABILITY_KEYRING is an ORDERED comma-separated list of
+      # kid:secret entries: the first entry signs new tokens; every entry
+      # verifies tokens carrying its kid (zero-downtime rotation). Retired
+      # kids are kept here until all tokens signed with them have expired.
+      CAPABILITY_KEYRING: ${CAPABILITY_KEYRING:-2026-09:dev-insecure-key-2026-09-change-me-0123456789,2026-01:dev-insecure-key-2026-01-change-me-0123456789}
+      # Only key accepted for tokens issued before keyring support (no kid).
+      CAPABILITY_LEGACY_SECRET: ${CAPABILITY_LEGACY_SECRET:-dev-insecure-legacy-secret-change-me-0123456789}
+      # Deprecated: works on its own as a single-key setup, but must not be
+      # combined with CAPABILITY_KEYRING (startup rejects the conflict).
+      CAPABILITY_SECRET: ${CAPABILITY_SECRET:-}
       CAPABILITY_ISSUER_KEY: ${CAPABILITY_ISSUER_KEY:-}
       CAPABILITY_ADMIN_KEY: ${CAPABILITY_ADMIN_KEY:-}
       CAPABILITY_DB_PATH: /data/capabilities.db
