@@ -8,6 +8,7 @@ Token wire format (URL-safe, no padding)::
 
     {
       "v":   1,                 # token version
+      "kid": "2026-09",         # signing key id, selected on verify (exact)
       "m":   "GET",             # bound HTTP method (canonical, upper case)
       "p":   "/files/report",   # bound canonical path
       "iat": 1727000000,        # issued-at, unix seconds
@@ -19,7 +20,11 @@ Token wire format (URL-safe, no padding)::
     }
 
 The signature covers the method and path as part of the payload, so a token
-cannot be moved to another endpoint or verb without breaking the MAC.
+cannot be moved to another endpoint or verb without breaking the MAC. The
+``kid`` claim sits inside the signed payload as well: it selects *exactly
+one* verification key, so rotating the ring never requires trying every
+key. Tokens without ``kid`` (issued before key-ring support) can only be
+verified against the explicitly configured legacy secret.
 """
 
 from __future__ import annotations
@@ -35,11 +40,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import Keyring
 from .db import Database
 
 TOKEN_VERSION = 1
 _ALGORITHM = "sha256"
 SEP_RUN_RE = re.compile(r"/+")
+
+#: Sentinel distinguishing "kid not supplied" (use the ring's active key)
+#: from an explicit ``kid=None`` (mint a legacy kid-less token).
+_UNSET: Any = object()
 
 
 class TokenError(Exception):
@@ -47,8 +57,8 @@ class TokenError(Exception):
 
     ``code`` is a stable machine-readable string returned by the HTTP API:
 
-    malformed / bad_signature / bad_payload / expired / method_mismatch /
-    path_mismatch / nonce_replayed / subject_revoked
+    malformed / bad_signature / bad_payload / unknown_key / expired /
+    method_mismatch / path_mismatch / nonce_replayed / subject_revoked
     """
 
     def __init__(self, code: str, message: str) -> None:
@@ -109,18 +119,25 @@ def build_payload(
     issued_at: int,
     nonce: str,
     one_time: bool,
+    kid: str | None = None,
     subject: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "v": TOKEN_VERSION,
-        "m": canonical_method(method),
-        "p": canonical_path(path),
-        "iat": int(issued_at),
-        "exp": int(expires_at),
-        "jti": nonce,
-        "one": bool(one_time),
-    }
+    payload: dict[str, Any] = {"v": TOKEN_VERSION}
+    # Only tokens signed by a named ring key carry a kid; passing None keeps
+    # the wire format of legacy kid-less tokens reproducible.
+    if kid is not None:
+        payload["kid"] = str(kid)
+    payload.update(
+        {
+            "m": canonical_method(method),
+            "p": canonical_path(path),
+            "iat": int(issued_at),
+            "exp": int(expires_at),
+            "jti": nonce,
+            "one": bool(one_time),
+        }
+    )
     if subject is not None:
         payload["sub"] = str(subject)
     if extra:
@@ -145,20 +162,28 @@ class IssuedToken:
     expires_in: int
     one_time: bool
     nonce: str
+    kid: str | None = None
 
 
 def issue_token(
-    secret_key: bytes,
+    keyring: Keyring,
     *,
     method: str,
     path: str,
     ttl_seconds: int,
     one_time: bool = False,
+    kid: str | None | object = _UNSET,
     subject: str | None = None,
     extra: dict[str, Any] | None = None,
     now: int | None = None,
     nonce: str | None = None,
 ) -> IssuedToken:
+    """Sign a new token with the key ring's active (first) key.
+
+    By default the ring's active ``kid`` is written into the protected
+    payload. Pass ``kid=None`` explicitly to mint a legacy kid-less token
+    (e.g. in migration tooling or tests).
+    """
     now = int(time.time()) if now is None else now
     if ttl_seconds <= 0:
         raise ValueError("ttl_seconds must be positive")
@@ -166,6 +191,16 @@ def issue_token(
     path = canonical_path(path)
     nonce = nonce or new_nonce()
     expires_at = now + int(ttl_seconds)
+    if kid is _UNSET:
+        kid = keyring.active_kid
+        secret_key = keyring.active_secret
+    elif kid is None:
+        secret_key = keyring.active_secret
+    else:
+        secret_key = keyring.get_secret(str(kid))
+        if secret_key is None:  # issuing must always use a configured key
+            raise ValueError(f"unknown signing kid {kid!r}")
+        kid = str(kid)
     payload = build_payload(
         method=method,
         path=path,
@@ -173,6 +208,7 @@ def issue_token(
         issued_at=now,
         nonce=nonce,
         one_time=one_time,
+        kid=kid,
         subject=subject,
         extra=extra,
     )
@@ -188,6 +224,7 @@ def issue_token(
         expires_in=ttl_seconds,
         one_time=one_time,
         nonce=nonce,
+        kid=kid,
     )
 
 
@@ -201,6 +238,7 @@ class VerifiedToken:
     one_time: bool
     subject: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    kid: str | None = None
 
 
 def parse_token(token: str) -> tuple[dict[str, Any], bytes, bytes]:
@@ -238,10 +276,40 @@ def _require_int(payload: dict[str, Any], key: str) -> int:
     return value
 
 
+def _select_verification_key(
+    payload: dict[str, Any], keyring: Keyring
+) -> tuple[bytes, str | None]:
+    """Pick exactly one verification key for a parsed (untrusted) payload.
+
+    A payload with a ``kid`` claim is verified against that one key only —
+    the ring is never walked trying each secret. Tokens without ``kid`` can
+    only be checked against the configured legacy secret. Both unknown
+    cases fail with ``unknown_key``.
+    """
+    if "kid" in payload:
+        kid = payload["kid"]
+        if not isinstance(kid, str) or not kid:
+            raise TokenError("bad_payload", "claim 'kid' must be a non-empty string")
+        secret = keyring.get_secret(kid)
+        if secret is None:
+            raise TokenError(
+                "unknown_key", f"unknown signing key id {kid!r} (key removed from ring?)"
+            )
+        return secret, kid
+
+    # Legacy kid-less token: the explicit legacy secret is the only option.
+    if keyring.legacy_secret is None:
+        raise TokenError(
+            "unknown_key",
+            "token has no 'kid' claim and no CAPABILITY_LEGACY_SECRET is configured",
+        )
+    return keyring.legacy_secret, None
+
+
 def verify_token(
     token: str,
     *,
-    secret_key: bytes,
+    keyring: Keyring,
     method: str,
     path: str,
     db: Database,
@@ -253,12 +321,15 @@ def verify_token(
     Verification order:
 
     1. structure (parse / base64 / JSON),
-    2. HMAC signature (constant-time compare),
-    3. payload claim types and version,
-    4. expiry,
-    5. method binding,
-    6. path binding,
-    7. subject revocation + one-time nonce consumption, decided inside a
+    2. key selection: the signed ``kid`` claim selects exactly one ring key;
+       tokens without ``kid`` may only use the legacy secret. There is no
+       fallback and the ring is never probed (``unknown_key`` otherwise),
+    3. HMAC signature with the selected key (constant-time compare),
+    4. payload claim types and version,
+    5. expiry,
+    6. method binding,
+    7. path binding,
+    8. subject revocation + one-time nonce consumption, decided inside a
        single SQLite transaction: a token whose ``iat`` is not after the
        subject's revocation cutoff is rejected with ``subject_revoked``
        and its nonce is *not* burned.
@@ -269,6 +340,8 @@ def verify_token(
     """
     now = int(time.time()) if now is None else now
     payload, payload_b, signature = parse_token(token)
+
+    secret_key, kid = _select_verification_key(payload, keyring)
 
     expected = hmac.new(secret_key, payload_b, hashlib.sha256).digest()
     if not hmac.compare_digest(expected, signature):
@@ -333,4 +406,5 @@ def verify_token(
         one_time=one_time,
         subject=subject,
         extra=extra,
+        kid=kid,
     )

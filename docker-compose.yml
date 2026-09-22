@@ -6,9 +6,15 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Override these in .env or your shell. A default dev secret is shipped
-      # in .env.example so the stack runs out of the box; change it for real use.
-      CAPABILITY_SECRET: ${CAPABILITY_SECRET:-dev-insecure-secret-change-me-0123456789}
+      # Ordered key ring: comma-separated kid:secret entries; the FIRST one
+      # signs new tokens and every entry verifies. Rotate by prepending the
+      # new key and keeping the old one until all old tokens have expired,
+      # then remove the old entry. A default dev key ships in .env.example so
+      # the stack runs out of the box — change it for real use.
+      CAPABILITY_KEYRING: ${CAPABILITY_KEYRING:-dev:dev-insecure-secret-change-me-0123456789}
+      # Optional key that verifies only tokens issued before key-ring support
+      # (they carry no kid). Empty = kid-less tokens are rejected 401.
+      CAPABILITY_LEGACY_SECRET: ${CAPABILITY_LEGACY_SECRET:-}
       CAPABILITY_ISSUER_KEY: ${CAPABILITY_ISSUER_KEY:-}
       CAPABILITY_ADMIN_KEY: ${CAPABILITY_ADMIN_KEY:-}
       CAPABILITY_DB_PATH: /data/capabilities.db

@@ -43,6 +43,9 @@ class IssueTokenRequest(BaseModel):
 class IssuedTokenResponse(BaseModel):
     token: str
     token_id: str
+    kid: str | None = Field(
+        default=None, description="Id of the ring key that signed this token"
+    )
     method: str
     path: str
     issued_at: int
@@ -75,6 +78,10 @@ class VerifyTokenRequest(BaseModel):
 
 class VerifyTokenResponse(BaseModel):
     valid: bool
+    kid: str | None = Field(
+        default=None,
+        description="Ring key id that verified the token (null for legacy kid-less tokens)",
+    )
     method: str
     path: str
     expires_at: int

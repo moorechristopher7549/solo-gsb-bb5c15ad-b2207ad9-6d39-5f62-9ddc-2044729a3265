@@ -19,7 +19,8 @@ import unittest
 from pathlib import Path
 
 _tmp = tempfile.mkdtemp(prefix="capapi-test-")
-os.environ["CAPABILITY_SECRET"] = "test-secret"
+os.environ["CAPABILITY_KEYRING"] = "ring-active:active-secret,ring-old:old-secret"
+os.environ["CAPABILITY_LEGACY_SECRET"] = "legacy-secret"
 os.environ["CAPABILITY_DB_PATH"] = os.path.join(_tmp, "test.db")
 os.environ["CAPABILITY_FILES_DIR"] = os.path.join(_tmp, "files")
 os.environ["CAPABILITY_DEFAULT_TTL"] = "300"
@@ -30,12 +31,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.config import Keyring, parse_keyring  # noqa: E402
 from app.main import app  # noqa: E402
 from app import tokens as tokenlib  # noqa: E402
 
 FILES_DIR = Path(os.environ["CAPABILITY_FILES_DIR"])
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 (FILES_DIR / "hello.txt").write_text("hello capability world\n", encoding="utf-8")
+
+#: Secrets from the configured test ring (first entry signs new tokens).
+ACTIVE_KID = "ring-active"
+OLD_KID = "ring-old"
+LEGACY_SECRET = b"legacy-secret"
+#: A kid that no ring contains: tokens claiming it must fail unknown_key.
+UNKNOWN_KID = "ring-gone"
 
 
 def _b64(raw: bytes) -> str:
@@ -145,8 +154,11 @@ class CapabilityApiTests(unittest.TestCase):
     def test_06_wrong_signature_rejected(self):
         data = self.issue()
         payload, sig = data["token"].split(".")
-        # Flip the last character of the signature.
-        flipped = sig[:-1] + ("A" if sig[-1] != "A" else "B")
+        # Flip the FIRST character of the signature: the first base64 symbol
+        # carries the top 6 bits of the digest, so the decoded bytes are
+        # guaranteed to differ (flipping the last symbol can be a no-op when
+        # the trailing 2 bits happen to be zero).
+        flipped = ("A" if sig[0] != "A" else "B") + sig[1:]
         resp = self.verify(f"{payload}.{flipped}")
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.json()["error"], "bad_signature")
@@ -184,7 +196,7 @@ class CapabilityApiTests(unittest.TestCase):
         from app.main import app as real_app
 
         issued = tokenlib.issue_token(
-            real_app.state.settings.secret_key,
+            real_app.state.settings.keyring,
             method="GET",
             path="/files/hello.txt",
             ttl_seconds=1,
@@ -240,7 +252,7 @@ class CapabilityApiTests(unittest.TestCase):
             try:
                 tokenlib.verify_token(
                     data["token"],
-                    secret_key=settings.secret_key,
+                    keyring=settings.keyring,
                     method="GET",
                     path="/files/hello.txt",
                     db=db,
@@ -305,7 +317,7 @@ class CapabilityApiTests(unittest.TestCase):
     def test_20_download_method_binding_blocks_head_token_on_get(self):
         # Token bound to HEAD cannot be used for GET.
         issued = tokenlib.issue_token(
-            app.state.settings.secret_key,
+            app.state.settings.keyring,
             method="HEAD",
             path="/files/hello.txt",
             ttl_seconds=60,
@@ -367,10 +379,10 @@ class CapabilityApiTests(unittest.TestCase):
 
     def test_25_revoke_blocks_old_tokens_new_ones_still_work(self):
         subject = "revo-basic"
-        secret = app.state.settings.secret_key
+        keyring = app.state.settings.keyring
         now = int(time.time())
         old = tokenlib.issue_token(
-            secret,
+            keyring,
             method="GET",
             path="/files/hello.txt",
             ttl_seconds=300,
@@ -393,7 +405,7 @@ class CapabilityApiTests(unittest.TestCase):
 
         # A token issued after the cutoff is unaffected.
         fresh = tokenlib.issue_token(
-            secret,
+            keyring,
             method="GET",
             path="/files/hello.txt",
             ttl_seconds=300,
@@ -405,14 +417,14 @@ class CapabilityApiTests(unittest.TestCase):
 
     def test_26_cutoff_boundary_is_inclusive(self):
         subject = "revo-boundary"
-        secret = app.state.settings.secret_key
+        keyring = app.state.settings.keyring
         now = int(time.time())
         at_cutoff = tokenlib.issue_token(
-            secret, method="GET", path="/files/hello.txt",
+            keyring, method="GET", path="/files/hello.txt",
             ttl_seconds=300, subject=subject, now=now,
         )
         after_cutoff = tokenlib.issue_token(
-            secret, method="GET", path="/files/hello.txt",
+            keyring, method="GET", path="/files/hello.txt",
             ttl_seconds=300, subject=subject, now=now + 1,
         )
         self.revoke(subject, cutoff=now)
@@ -504,7 +516,7 @@ class CapabilityApiTests(unittest.TestCase):
             try:
                 tokenlib.verify_token(
                     data["token"],
-                    secret_key=settings.secret_key,
+                    keyring=settings.keyring,
                     method="GET",
                     path="/files/hello.txt",
                     db=db,
@@ -553,7 +565,7 @@ class CapabilityApiTests(unittest.TestCase):
             try:
                 tokenlib.verify_token(
                     token,
-                    secret_key=settings.secret_key,
+                    keyring=settings.keyring,
                     method="GET",
                     path="/files/hello.txt",
                     db=db,
@@ -604,6 +616,295 @@ class CapabilityApiTests(unittest.TestCase):
         self.assertIsNone(db.get_subject_revocation("revo-purge-old"))
         self.assertIsNotNone(db.get_subject_revocation("revo-purge-fresh"))
         db.delete_subject_revocation("revo-purge-fresh")
+
+    # -- key ring / zero-downtime rotation ---------------------------------
+
+    @staticmethod
+    def _raw_token(payload: dict, secret: bytes) -> str:
+        """Sign an arbitrary payload dict with an arbitrary secret."""
+        import hashlib
+        import hmac as _hmac
+
+        payload_b = tokenlib._payload_to_bytes(payload)
+        signature = _hmac.new(secret, payload_b, hashlib.sha256).digest()
+        return f"{tokenlib._b64url_encode(payload_b)}.{tokenlib._b64url_encode(signature)}"
+
+    def _payload(self, **overrides):
+        now = int(time.time())
+        payload = tokenlib.build_payload(
+            method="GET",
+            path="/files/hello.txt",
+            expires_at=now + 120,
+            issued_at=now,
+            nonce=tokenlib.new_nonce(),
+            one_time=False,
+            kid=ACTIVE_KID,
+        )
+        payload.update(overrides)
+        # kid=None means a genuinely kid-less legacy token, not {"kid": null}.
+        if payload.get("kid") is None:
+            payload.pop("kid", None)
+        return payload
+
+    def test_34_issued_token_carries_active_kid_in_signed_payload(self):
+        data = self.issue()
+        self.assertEqual(data["kid"], ACTIVE_KID)
+        payload_b = base64.urlsafe_b64decode(data["token"].split(".")[0] + "==")
+        self.assertEqual(json.loads(payload_b)["kid"], ACTIVE_KID)
+
+        resp = self.verify(data["token"])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["kid"], ACTIVE_KID)
+
+    def test_35_rotated_old_key_still_verifies_unexpired_tokens(self):
+        # A token signed by the secondary ring entry (the previous active key).
+        issued = tokenlib.issue_token(
+            app.state.settings.keyring,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=120,
+            kid=OLD_KID,
+        )
+        self.assertEqual(issued.kid, OLD_KID)
+        resp = self.verify(issued.token)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["kid"], OLD_KID)
+
+        # And it works against the real download endpoint too.
+        issued2 = tokenlib.issue_token(
+            app.state.settings.keyring,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=120,
+            kid=OLD_KID,
+        )
+        resp = self.client.get(f"/files/hello.txt?token={issued2.token}")
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_36_unknown_kid_is_rejected_unknown_key_without_probing(self):
+        # Claims a kid the ring does not contain; signature is irrelevant —
+        # no key may be tried. Must fail before/without a signature check.
+        token = self._raw_token(self._payload(kid=UNKNOWN_KID), b"some-outsider-secret")
+        resp = self.verify(token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "unknown_key")
+
+        # Same guarantee on the guarded download endpoint.
+        resp = self.client.get(f"/files/hello.txt?token={token}")
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "unknown_key")
+
+    def test_37_removing_old_key_rejects_its_tokens_immediately(self):
+        from dataclasses import replace
+
+        settings = app.state.settings
+        issued = tokenlib.issue_token(
+            settings.keyring,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=120,
+            kid=OLD_KID,
+        )
+        self.assertEqual(self.verify(issued.token).status_code, 200)
+
+        # Simulate redeploying with the old entry removed from the ring.
+        shrunk = Keyring((settings.keyring.entries[0],), legacy_secret=LEGACY_SECRET)
+        app.state.settings = replace(settings, keyring=shrunk)
+        try:
+            resp = self.verify(issued.token)
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(resp.json()["error"], "unknown_key")
+        finally:
+            app.state.settings = settings
+
+    def test_38_legacy_kidless_token_verifies_only_with_legacy_secret(self):
+        # A token issued before key-ring support: no kid claim, signed with
+        # what is now CAPABILITY_LEGACY_SECRET.
+        token = self._raw_token(self._payload(kid=None), LEGACY_SECRET)
+        resp = self.verify(token)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(resp.json()["kid"])
+
+    def test_39_kidless_token_rejected_when_no_legacy_secret(self):
+        from dataclasses import replace
+
+        settings = app.state.settings
+        token = self._raw_token(self._payload(kid=None), LEGACY_SECRET)
+        ring_without_legacy = Keyring(settings.keyring.entries, legacy_secret=None)
+        app.state.settings = replace(settings, keyring=ring_without_legacy)
+        try:
+            resp = self.verify(token)
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(resp.json()["error"], "unknown_key")
+        finally:
+            app.state.settings = settings
+
+    def test_40_ring_is_never_walked_for_kidless_tokens(self):
+        # A kid-less token signed with an actual RING key must NOT verify:
+        # key selection routes kid-less tokens to the legacy secret only,
+        # so the HMAC differs -> bad_signature, never a ring trial success.
+        token = self._raw_token(self._payload(kid=None), b"old-secret")
+        resp = self.verify(token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "bad_signature")
+
+    def test_41_kid_is_signed_so_switching_it_breaks_the_mac(self):
+        issued = tokenlib.issue_token(
+            app.state.settings.keyring,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=120,
+            kid=OLD_KID,
+        )
+        payload_part, sig_part = issued.token.split(".")
+        raw = json.loads(base64.urlsafe_b64decode(payload_part + "=="))
+        # Attacker relabels the token to the active kid without re-signing.
+        raw["kid"] = ACTIVE_KID
+        token = f"{_b64(json.dumps(raw, sort_keys=True, separators=(',', ':')).encode())}.{sig_part}"
+        resp = self.verify(token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "bad_signature")
+
+    def test_42_full_rotation_is_zero_downtime_then_old_key_dropped(self):
+        from dataclasses import replace
+
+        settings = app.state.settings
+        # Tokens in flight before the rotation: active and old.
+        pre_active = self.issue()["token"]
+        pre_old = tokenlib.issue_token(
+            settings.keyring,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=120,
+            kid=OLD_KID,
+        ).token
+
+        # Rotation rollout: prepend the new key, keep both previous keys.
+        rotated = Keyring(
+            (
+                ("ring-2026-09", b"new-secret"),
+                (ACTIVE_KID, b"active-secret"),
+                (OLD_KID, b"old-secret"),
+            ),
+            legacy_secret=LEGACY_SECRET,
+        )
+        app.state.settings = replace(settings, keyring=rotated)
+        try:
+            # Every previously issued, unexpired token still verifies.
+            self.assertEqual(self.verify(pre_active).status_code, 200)
+            self.assertEqual(self.verify(pre_old).status_code, 200)
+            # New tokens are signed by the new first entry.
+            data = self.issue()
+            self.assertEqual(data["kid"], "ring-2026-09")
+            self.assertEqual(self.verify(data["token"]).status_code, 200)
+        finally:
+            app.state.settings = settings
+
+        # After the overlap window: drop the oldest key; its tokens die now,
+        # the rest keep working.
+        dropped = Keyring(
+            (("ring-2026-09", b"new-secret"), (ACTIVE_KID, b"active-secret")),
+            legacy_secret=LEGACY_SECRET,
+        )
+        app.state.settings = replace(settings, keyring=dropped)
+        try:
+            resp = self.verify(pre_old)
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(resp.json()["error"], "unknown_key")
+            self.assertEqual(self.verify(pre_active).status_code, 200)
+        finally:
+            app.state.settings = settings
+
+    def test_42b_non_string_kid_claim_is_bad_payload(self):
+        token = self._raw_token(self._payload(kid=123), b"active-secret")
+        resp = self.verify(token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "bad_payload")
+
+    # -- configuration / startup validation -------------------------------
+
+    def test_43_parse_keyring_order_and_colon_secret(self):
+        entries = parse_keyring("k1:secret-one, k2 :sec:with:colons ,k3:third")
+        self.assertEqual(
+            entries,
+            (("k1", b"secret-one"), ("k2", b"sec:with:colons"), ("k3", b"third")),
+        )
+        ring = Keyring(entries)
+        self.assertEqual(ring.active_kid, "k1")
+        self.assertEqual(ring.active_secret, b"secret-one")
+        self.assertEqual(ring.get_secret("k2"), b"sec:with:colons")
+        self.assertIsNone(ring.get_secret("nope"))
+
+    def test_44_startup_rejects_bad_keyring_config(self):
+        bad_values = [
+            "k1:secret,,k2:other",      # empty entry
+            "k1:secret,k2",             # missing colon / secret
+            "k1:",                      # empty secret
+            "k1:secret,k1:other",       # duplicate kid
+            ":secret",                  # empty kid
+        ]
+        for raw in bad_values:
+            with self.assertRaises(RuntimeError, msg=raw):
+                parse_keyring(raw)
+
+    def test_45_startup_rejects_conflicting_and_rejects_empty_ring(self):
+        from app.config import load_settings
+
+        saved = {
+            k: os.environ.get(k)
+            for k in ("CAPABILITY_KEYRING", "CAPABILITY_SECRET", "CAPABILITY_LEGACY_SECRET")
+        }
+        try:
+            os.environ["CAPABILITY_KEYRING"] = "k1:s1"
+            os.environ["CAPABILITY_SECRET"] = "solo-secret"
+            with self.assertRaises(RuntimeError):
+                load_settings()
+
+            os.environ.pop("CAPABILITY_SECRET", None)
+            os.environ["CAPABILITY_KEYRING"] = " , "
+            with self.assertRaises(RuntimeError):
+                load_settings()
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_46_legacy_single_secret_mode_still_boots_and_verifies(self):
+        from dataclasses import replace
+
+        from app.config import DEFAULT_KID, load_settings
+
+        saved = {
+            k: os.environ.get(k)
+            for k in ("CAPABILITY_KEYRING", "CAPABILITY_SECRET", "CAPABILITY_LEGACY_SECRET")
+        }
+        old_settings = app.state.settings
+        try:
+            os.environ.pop("CAPABILITY_KEYRING", None)
+            os.environ["CAPABILITY_SECRET"] = "solo-secret"
+            os.environ.pop("CAPABILITY_LEGACY_SECRET", None)
+            solo = load_settings()
+            self.assertEqual(solo.keyring.active_kid, DEFAULT_KID)
+            self.assertEqual(solo.keyring.active_secret, b"solo-secret")
+            # The same secret implicitly verifies pre-upgrade kid-less tokens.
+            self.assertEqual(solo.keyring.legacy_secret, b"solo-secret")
+
+            app.state.settings = solo
+            data = self.issue()
+            self.assertEqual(data["kid"], DEFAULT_KID)
+            self.assertEqual(self.verify(data["token"]).status_code, 200)
+
+            old_token = self._raw_token(self._payload(kid=None), b"solo-secret")
+            self.assertEqual(self.verify(old_token).status_code, 200)
+        finally:
+            app.state.settings = old_settings
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":
