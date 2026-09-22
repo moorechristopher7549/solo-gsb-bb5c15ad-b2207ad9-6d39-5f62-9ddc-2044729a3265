@@ -1,0 +1,30 @@
+services:
+  capability-api:
+    build: .
+    image: capability-token-api:latest
+    container_name: capability-token-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Override these in .env or your shell. A default dev secret is shipped
+      # in .env.example so the stack runs out of the box; change it for real use.
+      CAPABILITY_SECRET: ${CAPABILITY_SECRET:-dev-insecure-secret-change-me-0123456789}
+      CAPABILITY_ISSUER_KEY: ${CAPABILITY_ISSUER_KEY:-}
+      CAPABILITY_ADMIN_KEY: ${CAPABILITY_ADMIN_KEY:-}
+      CAPABILITY_DB_PATH: /data/capabilities.db
+      CAPABILITY_FILES_DIR: /app/files
+      CAPABILITY_DEFAULT_TTL: ${CAPABILITY_DEFAULT_TTL:-300}
+      CAPABILITY_MAX_TTL: ${CAPABILITY_MAX_TTL:-3600}
+    volumes:
+      - capability-data:/data
+      - ./files:/app/files:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  capability-data:
